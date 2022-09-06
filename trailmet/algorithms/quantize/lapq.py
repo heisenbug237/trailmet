@@ -35,6 +35,7 @@ class LAPQ(BaseQuantization):
         self.device = torch.device('cuda:{}'.format(self.gpu_id))
         self.calib_data = self.get_calib_samples(self.train_loader, self.num_samples)
         self.eval_count = count(0)
+        self._iter = count(0)
         self.min_loss = 1e6
 
 
@@ -101,18 +102,29 @@ class LAPQ(BaseQuantization):
 
         # use the optimal quantization step size ∆p∗ as a starting point for a gradient-free 
         # joint optimization algorithm, such as Powell’s method, to minimize the loss and find ∆∗.
+        self.q_args = wq_params      # To-Do : Make this more robust
         init_scales = lp_point
         min_method = "Powell"
         min_options = {}
         if self.maxiter is not None:
             min_options['maxiter'] = self.maxiter
         res = optim.minimize(lambda scales: self.evaluate_calibration_clipped(scales, self.qnn, **wq_params),
-                             np.asarray(init_scales), method=min_method, options=min_options)
+                             np.asarray(init_scales), method=min_method, options=min_options,
+                             callback=self.local_search_callback)
         scales = res.x
         self.qnn.set_quant_params(scales, self.device, **wq_params)
         print('Full quantization (W{}A{}) accuracy: {}'.format(self.w_bits, self.a_bits, 
                             self.test(self.qnn, self.val_loader, device=self.device))) 
 
+    def local_search_callback(self, scales):
+        it = next(self._iter)
+        # mq.set_clipping(x, inf_model.device)
+        self.qnn.set_quant_params(scales, self.device, **self.q_args)
+        # loss = inf_model.evaluate_calibration()
+        loss = self.evaluate_loss(self.qnn, self.device)
+        print("\n[{}]: Local search callback".format(it))
+        print("loss: {:.4f}\n".format(loss.item()))
+        # print(scales)
 
     def evaluate_calibration_clipped(self, scales: np.ndarray, q_model: QuantModel, **qargs):
         eval_count = next(self.eval_count)
