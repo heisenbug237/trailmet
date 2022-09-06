@@ -1,3 +1,4 @@
+
 from itertools import count
 import torch
 import torch.nn as nn
@@ -10,23 +11,6 @@ from trailmet.algorithms.quantize.quant_model import QuantModel, QuantModule
 
 
 class LAPQ(BaseQuantization):
-    """
-    Class for post-training quantization of models using loss aware post-training quantization
-    method based on - Loss Aware Post-training Quantization :- https://arxiv.org/abs/1911.07190
-    :param W_BITS: bitwidth for weight quantization
-    :param A_BITS: bitwidth for activation quantization
-    :params NUM_SAMPLES: number of samples for calibration dataset
-    :param ACT_QUANT: apply activation quantization
-    :params SYMM: set TRUE for symmetric quantization
-    :params UINT: set TRUE for unsigned int quantization
-    :params MAX_ITER: maximum number of iterations for optimization
-    :params VERBOSE: set TRUE for verbose true
-    :params PRINT_FREQ: Print Frquency
-    :params GPU_ID: To set the GPU id
-    :params SEED: To set SEED
-    :param SET_8BIT_HEAD_STEM: Set the first and the last layer to 8-bit
-    :param CHANNEL_WISE: apply channel_wise quantization for weights
-    """
     def __init__(self, model: nn.Module, dataloaders, **kwargs):
         super(LAPQ, self).__init__(**kwargs)
         self.model = model
@@ -42,7 +26,7 @@ class LAPQ(BaseQuantization):
         self.channel_wise = False   # lapq supports only layer-wise
         self.set_8bit_head_stem = kwargs.get('SET_8BIT_HEAD_STEM', False)   # To do: make this bug free for True
         self.test_before_calibration = True
-        self.maxiter = kwargs.get('MAX_ITER', 1000)
+        self.maxiter = kwargs.get('MAX_ITER', None)
         self.verbose = kwargs.get('VERBOSE', True)
         self.print_freq = kwargs.get('PRINT_FREQ', 20)
         self.gpu_id = kwargs.get('GPU_ID', 0)
@@ -148,18 +132,18 @@ class LAPQ(BaseQuantization):
         with torch.no_grad():
             if not hasattr(self, 'cal_set'):
                 self.cal_set = []
-                for i, (images, targets) in enumerate(self.train_loader):
-                    if i >= (1024//len(self.train_loader.dataset)): break                    # To do: change this for variable batch size
+                for i, (images, target) in enumerate(self.train_loader):
+                    if i>=16:                       # To do: change this for variable batch size
+                        break
                     images = images.to(device, non_blocking=True)
-                    targets = targets.to(device, non_blocking=True)
-                    self.cal_set.append((images, targets))
+                    target = target.to(device, non_blocking=True)
+                    self.cal_set.append((images, target))
 
             res = torch.tensor([0.]).to(device)
             for i in range(len(self.cal_set)):
-                images, targets = self.cal_set[i]
-                outputs = q_model(images)
-                loss = criterion(outputs, targets)
+                images, target = self.cal_set[i]
+                output = q_model(images)
+                loss = criterion(output, target)
                 res += loss
 
             return res / len(self.cal_set)
-        

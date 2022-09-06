@@ -42,6 +42,7 @@ class StraightThrough(nn.Module):
         return input
 
 class RoundSTE(torch.autograd.Function):
+    """customized round function with enabled backpropagation"""
     @staticmethod
     def forward(ctx, input):
         output = torch.round(input)
@@ -50,7 +51,7 @@ class RoundSTE(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         return grad_output
-    
+
 class FoldBN():
     """used to fold batch norm to prev linear or conv layer which helps reduce comutational overhead during quantization"""
     def __init__(self):

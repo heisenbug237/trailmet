@@ -10,13 +10,13 @@ from typing import Union
 from trailmet.models.resnet import BasicBlock, Bottleneck
 from trailmet.models.mobilenetv2 import InvertedResidual
 from trailmet.algorithms.quantize.quantize import StraightThrough, FoldBN
-from trailmet.algorithms.quantize.methods import UniformAffineQuantizer, LpNormQuantizer, FixQuantizationClipValue
+from trailmet.algorithms.quantize.methods import UniformAffineQuantizer, LpNormQuantizer, FixedClipValueQuantization
 
 
 quantization_mapping = {
     'uaq' : UniformAffineQuantizer,
     'lp_norm' : LpNormQuantizer,
-    'fix_clip' : FixQuantizationClipValue
+    'fix_clip' : FixedClipValueQuantization
 }
 
 #=========================

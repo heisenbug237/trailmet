@@ -278,9 +278,9 @@ class LpNormQuantizer(UniformQuantization):
         return err.item()
 
 
-class FixQuantizationClipValue(UniformQuantization):
+class FixedClipValueQuantization(UniformQuantization):
     def __init__(self, module, clip_value, device, **kwargs):
-        super(FixQuantizationClipValue, self).__init__(module, **kwargs)
+        super(FixedClipValueQuantization, self).__init__(module, **kwargs)
         self.clip_value = clip_value
         self.device = device
         assert self.clip_value is not None, 'missing parameter - clip_value'
