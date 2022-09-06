@@ -42,7 +42,7 @@ class LAPQ(BaseQuantization):
         self.channel_wise = False   # lapq supports only layer-wise
         self.set_8bit_head_stem = kwargs.get('SET_8BIT_HEAD_STEM', False)   # To do: make this bug free for True
         self.test_before_calibration = True
-        self.maxiter = kwargs.get('MAX_ITER', None)
+        self.maxiter = kwargs.get('MAX_ITER', 1000)
         self.verbose = kwargs.get('VERBOSE', True)
         self.print_freq = kwargs.get('PRINT_FREQ', 20)
         self.gpu_id = kwargs.get('GPU_ID', 0)
@@ -148,18 +148,17 @@ class LAPQ(BaseQuantization):
         with torch.no_grad():
             if not hasattr(self, 'cal_set'):
                 self.cal_set = []
-                for i, (images, target) in enumerate(self.train_loader):
-                    if i>=16:                       # To do: change this for variable batch size
-                        break
+                for i, (images, targets) in enumerate(self.train_loader):
+                    if i >= (1024//len(self.train_loader.dataset)): break                    # To do: change this for variable batch size
                     images = images.to(device, non_blocking=True)
-                    target = target.to(device, non_blocking=True)
-                    self.cal_set.append((images, target))
+                    targets = targets.to(device, non_blocking=True)
+                    self.cal_set.append((images, targets))
 
             res = torch.tensor([0.]).to(device)
             for i in range(len(self.cal_set)):
-                images, target = self.cal_set[i]
-                output = q_model(images)
-                loss = criterion(output, target)
+                images, targets = self.cal_set[i]
+                outputs = q_model(images)
+                loss = criterion(outputs, targets)
                 res += loss
 
             return res / len(self.cal_set)
