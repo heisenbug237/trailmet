@@ -8,14 +8,20 @@ from trailmet.algorithms.algorithms import BaseAlgorithm
 
 
 class RoundSTE(torch.autograd.Function):
-    """Grad enabled rounding"""
+    """grad enabled round function"""
     @staticmethod
-    def forward(ctx, input, nearest=True):
-        if nearest:
-            output = torch.round(input)
-        else: 
-            output = torch.floor(input)
-        return output
+    def forward(ctx, input):
+        return torch.round(input)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output
+    
+class FloorSTE(torch.autograd.Function):
+    """grad enabled floor function"""
+    @staticmethod
+    def forward(ctx, input):
+        return torch.floor(input)
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -48,9 +54,9 @@ class BaseQuantizer(nn.Module):
         if mode == 'nearest':
             x_int = torch.round(x / self.delta)
         elif mode == 'nearest_ste':
-            x_int = RoundSTE.apply(x / self.delta, nearest=True)
+            x_int = RoundSTE.apply(x / self.delta)
         elif mode == 'stochastic':
-            x_floor = RoundSTE.apply(x / self.delta, nearest=False)
+            x_floor = FloorSTE.apply(x / self.delta)
             x_int = x_floor + torch.bernoulli((x / self.delta) - x_floor)
         else: ValueError('wrong rounding mode')
         x_quant = torch.clamp(x_int + self.zero_point, 0, self.n_levels-1)
@@ -194,7 +200,7 @@ class AdaRoundQuantizer(BaseQuantizer):
 
     def forward(self, x: torch.tensor):
         if self.round_mode == 'learned_hard_sigmoid':
-            x_floor = RoundSTE.apply(x / self.delta, nearest = False)
+            x_floor = FloorSTE.apply(x / self.delta)
             if self.soft_targets:
                 x_int = x_floor + self.get_soft_targets()
             else:
@@ -209,7 +215,7 @@ class AdaRoundQuantizer(BaseQuantizer):
         return torch.clamp(torch.sigmoid(self.alpha) * (self.zeta - self.gamma) + self.gamma, 0, 1)
 
     def init_alpha(self, x: torch.Tensor):
-        x_floor = RoundSTE.apply(x / self.delta, nearest = False)
+        x_floor = FloorSTE.apply(x / self.delta)
         if self.round_mode == 'learned_hard_sigmoid':
             rest = (x / self.delta) - x_floor  # rest of rounding [0, 1)
             alpha = -torch.log((self.zeta - self.gamma) / (rest - self.gamma) - 1)  # => sigmoid(alpha) = rest
