@@ -7,7 +7,8 @@ import scipy.optimize as optim
 from tqdm import tqdm
 from itertools import count
 from trailmet.utils import seed_everything
-from trailmet.algorithms.quantize.quantize import BaseQuantization, Conv2dFunctor, LinearFunctor
+from trailmet.algorithms.quantize.quantize import BaseQuantModel, BaseQuantization
+from trailmet.algorithms.quantize.quantize import Conv2dFunctor, LinearFunctor
 from trailmet.algorithms.quantize.methods import LearnedStepSizeQuantization, FixedClipValueQuantization
 from trailmet.algorithms.quantize.qmodel import ParameterModuleWrapper, ActivationModuleWrapper
 
@@ -155,6 +156,13 @@ class LAPQ(BaseQuantization):
                 loss = criterion(output, target)
                 res += loss
             return res / len(self.cal_set)        
+
+
+
+# class QuantModel(BaseQuantModel):
+#     def __init__(self, model: nn.Module, weight_quant_params: dict, act_quant_params: dict, fold_bn=False):
+#         super().__init__(model, weight_quant_params, act_quant_params, fold_bn) 
+
 
 
 class QuantModel:

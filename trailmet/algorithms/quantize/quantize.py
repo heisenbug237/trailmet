@@ -307,7 +307,7 @@ def plot_layer_sensitivity(senitivities, test_bits, save_path, exp_name):
     )
     fig = graph_objects.Figure(data, layout)
     if not os.path.exists(f'{save_path}/logs/plots'):
-        os.mkdir(f'{save_path}/logs/plots')
+        os.makedirs(f'{save_path}/logs/plots')
     fig.write_image('{}/logs/plots/{}_sensitivities.png'.format(save_path, exp_name))
 
 
@@ -323,7 +323,7 @@ def plot_layer_precisions(bits_, save_path, exp_name):
     )
     fig = graph_objects.Figure(data, layout)
     if not os.path.exists(f'{save_path}/logs/plots'):
-        os.mkdir(f'{save_path}/logs/plots')
+        os.makedirs(f'{save_path}/logs/plots')
     fig.write_image('{}/logs/plots/{}_precisions.png'.format(save_path, exp_name))
 
 

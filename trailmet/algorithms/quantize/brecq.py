@@ -94,8 +94,8 @@ class BRECQ(BaseQuantization):
             w_bits, qm_size, max_size = self.sensitivity_analysis(
                 self.qnn, self.test_loader, self.use_bits, self.w_budget, 
                 self.save_path, '{}_{}_{}'.format(self.arch, w_compr, self.a_bits))
-            print('==> Found optimal config for approx model size: {:.2f} MB \
-                  (orig {:.2f} MB)'.format(qm_size, max_size/self.w_budget))
+            print('==> Found optimal config for approx model size: {:.2f} MB ' \
+                ' (orig {:.2f} MB)'.format(qm_size, max_size/self.w_budget))
             self.qnn.set_layer_precision(w_bits, self.a_bits)
             self.qnn.reset_scale_method('mse', True)
         
@@ -147,34 +147,36 @@ class BRECQ(BaseQuantization):
             print('==> Starting quantized-activation scaling parameter (delta) calibration')
             self.reconstruct_model(self.qnn, **kwargs)
             self.qnn.set_quant_state(weight_quant=True, act_quant=True)
+            torch.save(self.qnn.state_dict(), f'{self.save_path}/weights/{self.arch}_{w_compr}_{self.a_bits}.pth')
             print('Full quantization (W{}A{}) accuracy: {}'.format(w_compr, self.a_bits, 
                 self.test(self.qnn, self.test_loader, device=self.device))) 
         return self.qnn
 
 
-    def reconstruct_model(self, model: nn.Module, **kwargs):
+    def reconstruct_model(self, module: nn.Module, **kwargs):
         """
         Method for model parameters reconstruction. Takes in quantized model
         and optimizes weights by applying layer-wise reconstruction for first 
         and last layer, and block reconstruction otherwise.
         """
-        for name, module in model.named_children():
-            if isinstance(module, QuantModule):
-                if module.ignore_reconstruction is True:
+        for name, child_module in module.named_children():
+            if isinstance(child_module, QuantModule):
+                if child_module.ignore_reconstruction is True:
                     print('Ignore reconstruction of layer {}'.format(name))
                     continue
                 else:
                     print('Reconstruction for layer {}'.format(name))
-                    layer_reconstruction(self.qnn, module, **kwargs)
-            elif isinstance(module, BaseQuantBlock):
-                if module.ignore_reconstruction is True:
-                    print('Ignore reconstruction of block {}'.format(name))
+                    layer_reconstruction(self.qnn, child_module, **kwargs)
+            elif isinstance(child_module, BaseQuantBlock):
+                if child_module.ignore_reconstruction is True:
+                    print('Ignore reconstruction of {} block {}'.format(self._parent_name, name))
                     continue
                 else:
-                    print('Reconstruction for block {}'.format(name))
-                    block_reconstruction(self.qnn, module, **kwargs)
+                    print('Reconstruction for {} block {}'.format(self._parent_name, name))
+                    block_reconstruction(self.qnn, child_module, **kwargs)
             else:
-                self.reconstruct_model(module, **kwargs)
+                self._parent_name = name
+                self.reconstruct_model(child_module, **kwargs)
 
 
 class QuantModel(BaseQuantModel):

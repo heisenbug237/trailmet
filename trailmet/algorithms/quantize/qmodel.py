@@ -92,6 +92,8 @@ class QuantModule(nn.Module):
         self.use_weight_quant = weight_quant
         self.use_act_quant = act_quant
 
+    # def load_from_state_dict(self, )
+
 
 class BaseQuantBlock(nn.Module):
     """
