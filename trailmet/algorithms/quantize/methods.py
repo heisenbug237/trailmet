@@ -3,7 +3,20 @@ import torch.nn as nn
 import numpy as np
 import scipy.optimize as optim
 import warnings
-from trailmet.algorithms.quantize.quantize import BaseQuantization, RoundSTE
+from trailmet.algorithms.algorithms import BaseAlgorithm
+# from trailmet.algorithms.quantize.quantize import BaseQuantization, RoundSTE
+
+
+class RoundSTE(torch.autograd.Function):
+    """Grad enabled rounding"""
+    @staticmethod
+    def forward(ctx, input):
+        output = torch.round(input)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output
 
 """
 Quantization classes:-
@@ -89,23 +102,18 @@ class UniformAffineQuantizer(nn.Module):
                 zero_point = zero_point.view(-1, 1)
         else:
             if 'max' in self.scale_method:
-                x_min = min(x.min().item(), 0)
-                x_max = max(x.max().item(), 0)
+                x_max = x.max()
+                x_min = x.min()
                 if 'scale' in self.scale_method:
                     x_min = x_min * (self.n_bits + 2) / 8
                     x_max = x_max * (self.n_bits + 2) / 8
 
-                x_absmax = max(abs(x_min), x_max)
+                x_absmax = torch.max(x_min.abs(), x_max)
                 if self.sym:
                     x_min, x_max = -x_absmax if x_min < 0 else 0, x_absmax
 
-                delta = float(x_max - x_min) / (self.n_levels - 1)
-                if delta < 1e-8:
-                    warnings.warn('Quantization range close to zero: [{}, {}]'.format(x_min, x_max))
-                    delta = 1e-8
-
+                delta = (x_max - x_min) / (2 ** self.n_bits - 1)
                 zero_point = torch.round(-x_min / delta)
-                delta = torch.tensor(delta).type_as(x)
 
             elif self.scale_method == 'mse':
                 # For Lp norm minimization as described in LAPQ
@@ -117,7 +125,7 @@ class UniformAffineQuantizer(nn.Module):
                     new_max = x_max * (1.0 - (i * 0.01))
                     new_min = x_min * (1.0 - (i * 0.01))
                     x_q = self.quantize(x, new_max, new_min)
-                    score = BaseQuantization.lp_loss(x, x_q, p=2.4, reduction='all')
+                    score = BaseAlgorithm.lp_loss(x, x_q, p=2.4, reduction='all')
                     if score < best_score:
                         best_score = score
                         delta = (new_max - new_min) / (2 ** self.n_bits - 1)

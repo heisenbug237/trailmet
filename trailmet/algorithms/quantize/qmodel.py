@@ -5,11 +5,20 @@ import torch.nn.functional as F
 from typing import Union
 from trailmet.models.resnet import BasicBlock, Bottleneck
 from trailmet.models.mobilenet import InvertedResidual
-from trailmet.algorithms.quantize.quantize import StraightThrough
+# from trailmet.algorithms.quantize.quantize import StraightThrough
 from trailmet.algorithms.quantize.methods import MaxAbsStaticQuantization, LpNormQuantization
 from trailmet.algorithms.quantize.methods import UniformAffineQuantizer
 from trailmet.algorithms.quantize.methods import ActQuantizer
  
+
+class StraightThrough(nn.Module):
+    """Identity Layer"""
+    def __int__(self):
+        super().__init__()
+        pass
+
+    def forward(self, input):
+        return input
 
 
 #============================================

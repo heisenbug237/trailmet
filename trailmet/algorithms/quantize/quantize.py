@@ -50,7 +50,7 @@ class BaseQuantModel(nn.Module):
     def search_fold_remove_bn(self, module: nn.Module):
         """
         Recursively search for BatchNorm layers, fold them into the previous 
-        Conv2d or Linear layers and set them to a StraightThrough layer.
+        Conv2d or Linear layers and set them as a StraightThrough layer.
         """
         prev_module = None
         for name, child_module in module.named_children():
@@ -166,7 +166,8 @@ class BaseQuantization(BaseAlgorithm):
 
     def get_calib_samples(self, train_loader, num_samples):
         """
-        Get calibration-set samples for finetuning weights and clipping parameters
+        Get calibration-dataset samples for finetuning quantized weights and 
+        quantization parameters
         """
         calib_data = []
         for batch in train_loader:
@@ -174,6 +175,12 @@ class BaseQuantization(BaseAlgorithm):
             if len(calib_data)*batch[0].size(0) >= num_samples:
                 break
         return torch.cat(calib_data, dim=0)[:num_samples]
+
+    # def round_ste(x: torch.Tensor):
+    #     """
+    #     Implement Straight-Through Estimator for rounding operation.
+    #     """
+    #     return (x.round() - x).detach() + x
 
     # def absorb_bn(self, module, bn_module):
     #     w = module.weight.data
@@ -210,7 +217,8 @@ class BaseQuantization(BaseAlgorithm):
     #         self.search_absorbe_bn(m)
     #         prev = m
 
-    def sensitivity_analysis(self, qmodel: BaseQuantModel, dataloader, test_bits, budget, exp_name):
+    def sensitivity_analysis(self, qmodel: BaseQuantModel, dataloader, test_bits, 
+            budget, save_path, exp_name):
         qmodel.set_quant_state(False, False)
         inputs = None
         fp_outputs = None
@@ -220,7 +228,8 @@ class BaseQuantization(BaseAlgorithm):
                 fp_outputs = qmodel(inputs)
                 fp_outputs = F.softmax(fp_outputs, dim=1)
                 break
-        sensitivities = [[0 for i in range(len(qmodel.quant_modules))] for j in range(len(test_bits))]
+        sensitivities = [[0 for i in range(len(qmodel.quant_modules))] 
+            for j in range(len(test_bits))]
         for i, layer in enumerate(qmodel.quant_modules):
             for j, bit in enumerate(test_bits):
                 layer.set_quant_state(True, True)
@@ -233,11 +242,12 @@ class BaseQuantization(BaseAlgorithm):
                     kld = symmetric_kl_div(tmp_outputs, fp_outputs)
                 sensitivities[j][i] = kld.item()
                 layer.set_quant_state(False, False)
-        plot_layer_sensitivity(sensitivities, test_bits, exp_name)
+                layer.weight_quantizer.scale_method = 'mse'
+        plot_layer_sensitivity(sensitivities, test_bits, save_path, exp_name)
 
         weight_numels = [qmodule.weight.numel() for qmodule in qmodel.quant_modules]
-        node_list = self.dp_most_profit_over_cost(sensitivities, len(qmodel.quant_modules), weight_numels)
-        constraint = sum(weight_numels)*32*budget / (8*24*24)
+        node_list = self.dp_most_profit_over_cost(sensitivities, len(qmodel.quant_modules), weight_numels, test_bits)
+        constraint = sum(weight_numels)*32*budget / (8*1024*1024)
         good_nodes = [node for node in node_list if node.cost <= constraint]
         bits = []
         node = good_nodes[-1]
@@ -247,7 +257,7 @@ class BaseQuantization(BaseAlgorithm):
         bits.reverse()
         bits = bits[1:]
         assert len(bits)==len(qmodel.quant_modules)
-        plot_layer_precisions(bits, exp_name)
+        plot_layer_precisions(bits, save_path, exp_name)
         qmodel_size = 0
         for i, layer in enumerate(qmodel.quant_modules):
             qmodel_size += layer.weight.numel()*bits[i]/(8*1024*1024)
@@ -283,13 +293,8 @@ class BaseQuantization(BaseAlgorithm):
             current_list = pruned_list
         return current_list
     
-    # def round_ste(x: torch.Tensor):
-    #     """
-    #     Implement Straight-Through Estimator for rounding operation.
-    #     """
-    #     return (x.round() - x).detach() + x
 
-def plot_layer_sensitivity(senitivities, test_bits, exp_name):
+def plot_layer_sensitivity(senitivities, test_bits, save_path, exp_name):
     data = [graph_objects.Scatter(
         y = senitivities[i],
         mode = 'lines + markers',
@@ -301,12 +306,12 @@ def plot_layer_sensitivity(senitivities, test_bits, exp_name):
         yaxis = dict(title='sensitivity of quantization', type='log')
     )
     fig = graph_objects.Figure(data, layout)
-    if not os.path.exists('./logs/plots'):
-        os.mkdir('./logs/plots')
-    fig.write_image('./logs/plots/{}_sensitivities.png'.format(exp_name))
+    if not os.path.exists(f'{save_path}/logs/plots'):
+        os.mkdir(f'{save_path}/logs/plots')
+    fig.write_image('{}/logs/plots/{}_sensitivities.png'.format(save_path, exp_name))
 
 
-def plot_layer_precisions(bits_, exp_name):
+def plot_layer_precisions(bits_, save_path, exp_name):
     data = [graph_objects.Scatter(
         y = bits_,
         mode = 'lines + markers'
@@ -317,9 +322,9 @@ def plot_layer_precisions(bits_, exp_name):
         yaxis = dict(title='weight bitwidth')
     )
     fig = graph_objects.Figure(data, layout)
-    if not os.path.exists('./logs/plots'):
-        os.mkdir('./logs/plots')
-    fig.write_image('./logs/plots/{}_bitwidths.png'.format(exp_name))
+    if not os.path.exists(f'{save_path}/logs/plots'):
+        os.mkdir(f'{save_path}/logs/plots')
+    fig.write_image('{}/logs/plots/{}_precisions.png'.format(save_path, exp_name))
 
 
 def kl_divergence(P, Q):
@@ -371,68 +376,68 @@ class LinearFunctor:
         return res
 
 # TODO : To migrate all BN-layer folding function calls to the ones defined inside BaseQuantization class 
-class FoldBN():
-    """used to fold batch norm to prev linear or conv layer which helps reduce comutational overhead during quantization"""
-    def __init__(self):
-        pass
+# class FoldBN():
+#     """used to fold batch norm to prev linear or conv layer which helps reduce comutational overhead during quantization"""
+#     def __init__(self):
+#         pass
 
-    def _fold_bn(self, conv_module, bn_module):
-        w = conv_module.weight.data
-        y_mean = bn_module.running_mean
-        y_var = bn_module.running_var
-        safe_std = torch.sqrt(y_var + bn_module.eps)
-        w_view = (conv_module.out_channels, 1, 1, 1)
-        if bn_module.affine:
-            weight = w * (bn_module.weight / safe_std).view(w_view)
-            beta = bn_module.bias - bn_module.weight * y_mean / safe_std
-            if conv_module.bias is not None:
-                bias = bn_module.weight * conv_module.bias / safe_std + beta
-            else:
-                bias = beta
-        else:
-            weight = w / safe_std.view(w_view)
-            beta = -y_mean / safe_std
-            if conv_module.bias is not None:
-                bias = conv_module.bias / safe_std + beta
-            else:
-                bias = beta
-        return weight, bias
-
-
-    def fold_bn_into_conv(self, conv_module, bn_module):
-        w, b = self._fold_bn(conv_module, bn_module)
-        if conv_module.bias is None:
-            conv_module.bias = nn.Parameter(b)
-        else:
-            conv_module.bias.data = b
-        conv_module.weight.data = w
-        # set bn running stats
-        bn_module.running_mean = bn_module.bias.data
-        bn_module.running_var = bn_module.weight.data ** 2
+#     def _fold_bn(self, conv_module, bn_module):
+#         w = conv_module.weight.data
+#         y_mean = bn_module.running_mean
+#         y_var = bn_module.running_var
+#         safe_std = torch.sqrt(y_var + bn_module.eps)
+#         w_view = (conv_module.out_channels, 1, 1, 1)
+#         if bn_module.affine:
+#             weight = w * (bn_module.weight / safe_std).view(w_view)
+#             beta = bn_module.bias - bn_module.weight * y_mean / safe_std
+#             if conv_module.bias is not None:
+#                 bias = bn_module.weight * conv_module.bias / safe_std + beta
+#             else:
+#                 bias = beta
+#         else:
+#             weight = w / safe_std.view(w_view)
+#             beta = -y_mean / safe_std
+#             if conv_module.bias is not None:
+#                 bias = conv_module.bias / safe_std + beta
+#             else:
+#                 bias = beta
+#         return weight, bias
 
 
-    def is_bn(self, m):
-        return isinstance(m, nn.BatchNorm2d) or isinstance(m, nn.BatchNorm1d)
+#     def fold_bn_into_conv(self, conv_module, bn_module):
+#         w, b = self._fold_bn(conv_module, bn_module)
+#         if conv_module.bias is None:
+#             conv_module.bias = nn.Parameter(b)
+#         else:
+#             conv_module.bias.data = b
+#         conv_module.weight.data = w
+#         # set bn running stats
+#         bn_module.running_mean = bn_module.bias.data
+#         bn_module.running_var = bn_module.weight.data ** 2
 
 
-    def is_absorbing(self, m):
-        return (isinstance(m, nn.Conv2d)) or isinstance(m, nn.Linear)
+#     def is_bn(self, m):
+#         return isinstance(m, nn.BatchNorm2d) or isinstance(m, nn.BatchNorm1d)
 
 
-    def search_fold_and_remove_bn(self, model: nn.Module):
-        """
-        method to recursively search for batch norm layers, absorb them into 
-        the previous linear or conv layers, and set it to an identity layer 
-        """
-        model.eval()
-        prev = None
-        for n, m in model.named_children():
-            if self.is_bn(m) and self.is_absorbing(prev):
-                self.fold_bn_into_conv(prev, m)
-                # set the bn module to straight through
-                setattr(model, n, StraightThrough())
-            elif self.is_absorbing(m):
-                prev = m
-            else:
-                prev = self.search_fold_and_remove_bn(m)
-        return prev
+#     def is_absorbing(self, m):
+#         return (isinstance(m, nn.Conv2d)) or isinstance(m, nn.Linear)
+
+
+#     def search_fold_and_remove_bn(self, model: nn.Module):
+#         """
+#         method to recursively search for batch norm layers, absorb them into 
+#         the previous linear or conv layers, and set it to an identity layer 
+#         """
+#         model.eval()
+#         prev = None
+#         for n, m in model.named_children():
+#             if self.is_bn(m) and self.is_absorbing(prev):
+#                 self.fold_bn_into_conv(prev, m)
+#                 # set the bn module to straight through
+#                 setattr(model, n, StraightThrough())
+#             elif self.is_absorbing(m):
+#                 prev = m
+#             else:
+#                 prev = self.search_fold_and_remove_bn(m)
+#         return prev

@@ -1,4 +1,3 @@
-import copy
 import torch
 import torch.nn as nn
 import torch.distributed as dist
@@ -35,7 +34,7 @@ class BRECQ(BaseQuantization):
     """
     def __init__(self, model: nn.Module, dataloaders, **kwargs):
         super(BRECQ, self).__init__(**kwargs)
-        self.model = copy.deepcopy(model)
+        self.model = model
         self.train_loader = dataloaders['train']
         self.test_loader = dataloaders['test']
         self.kwargs = kwargs
@@ -44,18 +43,18 @@ class BRECQ(BaseQuantization):
         self.channel_wise = self.kwargs.get('CHANNEL_WISE', True)
         self.act_quant = self.kwargs.get('ACT_QUANT', True)
         self.set_8bit_head_stem = self.kwargs.get('SET_8BIT_HEAD_STEM', False)
-        self.arch = self.kwargs.get('ARCH', 'res50')
         self.w_budget = self.kwargs.get('W_BUDGET', None)
         self.use_bits = self.kwargs.get('USE_BITS', [2,4,8])
-        self.exp_name = self.arch + str(self.w_budget)
-
-        self.precision_config = self.kwargs.get('PREC_CONFIG', [])
+        self.arch = self.kwargs.get('ARCH', '')
+        self.save_path = self.kwargs.get('SAVE_PATH', './runs/')
         self.num_samples = self.kwargs.get('NUM_SAMPLES', 1024)
-        self.weight = self.kwargs.get('WEIGHT', 0.01)
+
         self.iters_w = self.kwargs.get('ITERS_W', 10000)
         self.iters_a = self.kwargs.get('ITERS_A', 10000)
         self.optimizer = self.kwargs.get('OPTIMIZER', 'adam')
+        self.weight = self.kwargs.get('WEIGHT', 0.01)
         self.lr = self.kwargs.get('LR', 4e-4)
+
         self.gpu_id = self.kwargs.get('GPU_ID', 0)
         self.calib_bs = self.kwargs.get('CALIB_BS', 64)
         self.seed = self.kwargs.get('SEED', 42)
@@ -90,31 +89,28 @@ class BRECQ(BaseQuantization):
         self.qnn = self.qnn.to(self.device)
         self.qnn.eval()
 
-        # for i in range(len(self.precision_config)):
-        #     conf = self.precision_config[i]
-        #     self.qnn.set_layer_precision(conf[2], conf[3], conf[0], conf[1])
-        #     print(f'==> Layers from {conf[0]} to {conf[1]} set to precision w{conf[2]}a{conf[3]}')
-        
+        w_compr = self.w_bits/32 if self.w_budget is None else self.w_budget
         if self.w_budget is not None:
             w_bits, qm_size, max_size = self.sensitivity_analysis(
-                self.qnn, self.test_loader, self.use_bits, self.exp_name)
+                self.qnn, self.test_loader, self.use_bits, self.w_budget, 
+                self.save_path, '{}_{}_{}'.format(self.arch, w_compr, self.a_bits))
             print('==> Found optimal config for approx model size: {:.2f} MB \
                   (orig {:.2f} MB)'.format(qm_size, max_size/self.w_budget))
             self.qnn.set_layer_precision(w_bits, self.a_bits)
+            self.qnn.reset_scale_method('mse', True)
+        
         if self.set_8bit_head_stem:
             print('==> Setting the first and the last layer to 8-bit')
             self.qnn.set_head_stem_precision(8)
-        
+
         self.cali_data = self.get_calib_samples(self.train_loader, self.num_samples)
-        
-        # Initialiaze weight quantization parameters 
         self.qnn.set_quant_state(True, False)
         print('==> Initializing weight quantization parameters')
         _ = self.qnn(self.cali_data[:self.calib_bs].to(self.device))
         if self.test_before_calibration:
             print('Quantized accuracy before brecq: {}'.format(self.test(self.qnn, self.test_loader, device=self.device)))
         
-        # Start weight calibration
+        # Start quantized weight calibration
         kwargs = dict(
             cali_data=self.cali_data, 
             iters=self.iters_w, 
@@ -126,7 +122,7 @@ class BRECQ(BaseQuantization):
             opt_mode='mse', 
             optim=self.optimizer
         )
-        print('==> Starting weight calibration')
+        print('==> Starting quantized-weight rounding parameter (alpha) calibration')
         self.reconstruct_model(self.qnn, **kwargs)
         self.qnn.set_quant_state(weight_quant=True, act_quant=False)
         print('Weight quantization accuracy: {}'.format(self.test(self.qnn, self.test_loader, device=self.device)))
@@ -136,9 +132,6 @@ class BRECQ(BaseQuantization):
             self.qnn.set_quant_state(True, True)
             with torch.no_grad():
                 _ = self.qnn(self.cali_data[:self.calib_bs].to(self.device))
-            
-            # Disable output quantization because network output
-            # does not get involved in further computation
             self.qnn.disable_network_output_quantization()
             
             # Start activation rounding calibration
@@ -151,9 +144,10 @@ class BRECQ(BaseQuantization):
                 p=self.p, 
                 optim=self.optimizer
             )
+            print('==> Starting quantized-activation scaling parameter (delta) calibration')
             self.reconstruct_model(self.qnn, **kwargs)
             self.qnn.set_quant_state(weight_quant=True, act_quant=True)
-            print('Full quantization (W{}A{}) accuracy: {}'.format(self.w_bits, self.a_bits, 
+            print('Full quantization (W{}A{}) accuracy: {}'.format(w_compr, self.a_bits, 
                 self.test(self.qnn, self.test_loader, device=self.device))) 
         return self.qnn
 
@@ -185,7 +179,15 @@ class BRECQ(BaseQuantization):
 
 class QuantModel(BaseQuantModel):
     def __init__(self, model: nn.Module, weight_quant_params: dict, act_quant_params: dict):
-        super().__init__(model, weight_quant_params, act_quant_params, fold_bn=True)
+        super(QuantModel, self).__init__(model, weight_quant_params, act_quant_params, fold_bn=True)
+
+    def reset_scale_method(self, scale_method = 'mse', act_quant_reset = False):
+        for module in self.quant_modules:
+            module.weight_quantizer.scale_method = scale_method
+            module.weight_quantizer.inited = False
+            if act_quant_reset:
+                module.act_quantizer.scale_method = scale_method
+                module.act_quantizer.inited = False
 
     def quantize_model_till(self, layer, act_quant: bool = False):
         """
@@ -212,6 +214,9 @@ class QuantModel(BaseQuantModel):
         self.quant_modules[0].ignore_reconstruction = True
 
     def disable_network_output_quantization(self):
+        """
+        Disable Network Output Quantization
+        """
         self.quant_modules[-1].disable_act_quant = True
 
     def synchorize_activation_statistics(self):
