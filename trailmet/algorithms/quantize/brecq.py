@@ -48,6 +48,7 @@ class BRECQ(BaseQuantization):
         self.arch = self.kwargs.get('ARCH', '')
         self.save_path = self.kwargs.get('SAVE_PATH', './runs/')
         self.num_samples = self.kwargs.get('NUM_SAMPLES', 1024)
+        self.init_method = self.kwargs.get('INIT_METHOD', 'mse')
 
         self.iters_w = self.kwargs.get('ITERS_W', 10000)
         self.iters_a = self.kwargs.get('ITERS_A', 10000)
@@ -97,7 +98,7 @@ class BRECQ(BaseQuantization):
             print('==> Found optimal config for approx model size: {:.2f} MB ' \
                 ' (orig {:.2f} MB)'.format(qm_size, max_size/self.w_budget))
             self.qnn.set_layer_precision(w_bits, self.a_bits)
-            self.qnn.reset_scale_method('mse', True)
+            self.qnn.reset_scale_method(self.init_method, True)
         
         if self.set_8bit_head_stem:
             print('==> Setting the first and the last layer to 8-bit')

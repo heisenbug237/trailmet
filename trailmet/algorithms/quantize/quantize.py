@@ -32,6 +32,7 @@ supported = {
     Bottleneck: QuantBottleneck,
     InvertedResidual: QuantInvertedResidual,
 }
+
 class BaseQuantModel(nn.Module):
     """base model wrapping class for quantization algorithms"""
     def __init__(self, model: nn.Module, weight_quant_params: dict = {},

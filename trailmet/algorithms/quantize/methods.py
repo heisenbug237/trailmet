@@ -10,8 +10,11 @@ from trailmet.algorithms.algorithms import BaseAlgorithm
 class RoundSTE(torch.autograd.Function):
     """Grad enabled rounding"""
     @staticmethod
-    def forward(ctx, input):
-        output = torch.round(input)
+    def forward(ctx, input, nearest=True):
+        if nearest:
+            output = torch.round(input)
+        else: 
+            output = torch.floor(input)
         return output
 
     @staticmethod
@@ -31,29 +34,29 @@ class BaseQuantizer(nn.Module):
         self.zero_point = zero_point
         self.inited = inited
 
-    def _register_buffer(self, name, value):
+    def __register_buffer__(self, name, value):
         if hasattr(self, name):
             delattr(self, name)
         self.register_buffer(name, value)
 
-    def _register_parameter(self, name, value):
+    def __register_parameter__(self, name, value):
         if hasattr(self, name):
             delattr(self, name)
         self.register_parameter(name, nn.Parameter(value))
 
-    def _quantize(self, x, mode):
+    def __quantize__(self, x, mode):
         if mode == 'nearest':
             x_int = torch.round(x / self.delta)
         elif mode == 'nearest_ste':
-            x_int = RoundSTE.apply(x / self.delta)
+            x_int = RoundSTE.apply(x / self.delta, nearest=True)
         elif mode == 'stochastic':
-            x_floor = torch.floor(x / self.delta)
-            x_int = x_floor + torch.bernoulli((x/self.delta)-x_floor)
+            x_floor = RoundSTE.apply(x / self.delta, nearest=False)
+            x_int = x_floor + torch.bernoulli((x / self.delta) - x_floor)
         else: ValueError('wrong rounding mode')
         x_quant = torch.clamp(x_int + self.zero_point, 0, self.n_levels-1)
         return x_quant
     
-    def _dequantize(self, xq):
+    def __dequantize__(self, xq):
         xq_float = (xq - self.zero_point) * self.delta
         return xq_float
 
@@ -81,15 +84,15 @@ class UniformAffineQuantizer(BaseQuantizer):
         if not self.inited:
             if self.leaf_param:
                 delta, zero_point = self.init_quantization_scale(x, self.channel_wise)
-                self._register_parameter('delta', delta)
+                self.__register_parameter__('delta', delta)
             else:
                 delta, zero_point = self.init_quantization_scale(x, self.channel_wise)
-                self._register_buffer('delta', delta)
-            self._register_buffer('zero_point', zero_point)
+                self.__register_buffer__('delta', delta)
+            self.__register_buffer__('zero_point', zero_point)
             self.inited = True
         # apply fake quantization
-        x_quant = self._quantize(x, 'nearest_ste')
-        x_dequant = self._dequantize(x_quant)
+        x_quant = self.__quantize__(x, 'nearest_ste')
+        x_dequant = self.__dequantize__(x_quant)
         return x_dequant
 
     def init_quantization_scale(self, x: torch.Tensor, channel_wise = False):
@@ -121,33 +124,35 @@ class UniformAffineQuantizer(BaseQuantizer):
                 x_absmax = torch.max(x_min.abs(), x_max)
                 if self.symmetric:
                     x_min, x_max = -x_absmax if x_min < 0 else 0, x_absmax
-                delta = (x_max - x_min) / (2 ** self.n_bits - 1)
+                delta = (x_max - x_min) / (self.n_levels - 1)
                 zero_point = torch.round(-x_min / delta)
 
             elif 'mse' in self.scale_method:
                 # For Lp norm minimization as described in LAPQ
                 x_max, x_min = x.max(), x.min()
-                best_score = 1e+10
+                best_loss = 1e+10
                 for i in range(80):
                     new_max = x_max * (1.0 - (i * 0.01))
                     new_min = x_min * (1.0 - (i * 0.01))
-                    x_q = self.quantize_with_stats(x, new_max, new_min)
-                    score = BaseAlgorithm.lp_loss(x, x_q, p=2.4, reduction='all')
-                    if score < best_score:
-                        best_score = score
+                    # x_q = self.quantize_with_stats(x, new_max, new_min)
+                    # score = BaseAlgorithm.lp_loss(x, x_q, p=2.4, reduction='all')
+                    loss = self.estimate_quant_error(x, new_max, new_min)
+                    if loss < best_loss:
+                        best_loss = loss
                         delta = (new_max - new_min) / (2 ** self.n_bits - 1)
                         zero_point = torch.round(- new_min / delta)
             else:
                 raise NotImplementedError
         return delta, zero_point
 
-    def quantize_with_stats(self, x, max, min):
-        delta = (max - min) / (2 ** self.n_bits - 1)
-        zero_point = torch.round(- min / delta)
+    def estimate_quant_error(self, x: torch.Tensor, x_max, x_min, p=2.4):
+        delta = (x_max - x_min) / (self.n_levels - 1)
+        zero_point = torch.round( -x_min / delta)
         x_int = torch.round(x / delta) # we assume weight quantization is always signed
         x_quant = torch.clamp(x_int + zero_point, 0, self.n_levels - 1)
-        x_float_q = (x_quant - zero_point) * delta
-        return x_float_q
+        x_dequant = (x_quant - zero_point) * delta
+        err = torch.mean(torch.abs(x_dequant - x) ** p)
+        return err
 
     def bitwidth_refactor(self, refactored_bit: int):
         assert refactored_bit in [2,3,4,8,16,32], 'bitwidth not supported'
@@ -156,7 +161,7 @@ class UniformAffineQuantizer(BaseQuantizer):
         self.inited = False
 
     def extra_repr(self):
-        s = 'bit={n_bits}, scale_method={scale_method}, symmetric={sym}, channel_wise={channel_wise},' \
+        s = 'bit={n_bits}, scale_method={scale_method}, symmetric={symmetric}, channel_wise={channel_wise},' \
             ' leaf_param={leaf_param}'
         return s.format(**self.__dict__)
 
@@ -178,46 +183,84 @@ class AdaRoundQuantizer(BaseQuantizer):
             uaq.channel_wise, uaq.delta, uaq.zero_point, inited=True)
         self.round_mode = round_mode
         self.soft_targets = False
+        self.__register_buffer__('delta', uaq.delta)
+        self.__register_buffer__('zero_point', uaq.zero_point)
 
         # params for sigmoid function
         self.alpha = None
         self.beta = 2/3
         self.gamma, self.zeta = -0.1, 1.1
         self.init_alpha(x = weight_tensor.clone())
-        self.register_buffer('delta', self.delta)
-        self.register_buffer('zero_point', self.zero_point)
 
-    def forward(self, x):
+    def forward(self, x: torch.tensor):
         if self.round_mode == 'learned_hard_sigmoid':
-            x_floor = torch.floor(x / self.delta)
+            x_floor = RoundSTE.apply(x / self.delta, nearest = False)
             if self.soft_targets:
                 x_int = x_floor + self.get_soft_targets()
             else:
                 x_int = x_floor + (self.alpha >= 0).float()
+            x_quant = torch.clamp(x_int + self.zero_point, 0, self.n_levels - 1)
         else:
-            raise ValueError('Wrong rounding mode')
-
-        x_quant = torch.clamp(x_int + self.zero_point, 0, self.n_levels - 1)
-        x_float_q = (x_quant - self.zero_point) * self.delta
-
-        return x_float_q
+            x_quant = self.__quantize__(x, mode = self.round_mode)
+        x_dequant = self.__dequantize__(x_quant)
+        return x_dequant
 
     def get_soft_targets(self):
         return torch.clamp(torch.sigmoid(self.alpha) * (self.zeta - self.gamma) + self.gamma, 0, 1)
 
     def init_alpha(self, x: torch.Tensor):
-        x_floor = torch.floor(x / self.delta)
+        x_floor = RoundSTE.apply(x / self.delta, nearest = False)
         if self.round_mode == 'learned_hard_sigmoid':
-            # print('Init alpha to be FP32')
             rest = (x / self.delta) - x_floor  # rest of rounding [0, 1)
             alpha = -torch.log((self.zeta - self.gamma) / (rest - self.gamma) - 1)  # => sigmoid(alpha) = rest
-            self._register_parameter('alpha', alpha)
+            self.__register_parameter__('alpha', alpha)
         else:
             raise NotImplementedError
         
     def extra_repr(self):
-        s = 'bit={n_bits}, round_mode={round_mode}, symmetric={sym}, channel_wise={channel_wise}' 
+        s = 'bit={n_bits}, round_mode={round_mode}, symmetric={symmetric}, channel_wise={channel_wise}' 
         return s.format(**self.__dict__)
+
+
+class LpNormQuantizer(BaseQuantizer):
+    """
+    no affine, no channel_wise
+    """
+    def __init__(self, n_bits, symm, channel_wise, delta, zero_point, inited, 
+            p_val, weight_tensor: torch.Tensor):
+        super().__init__(n_bits, symm, channel_wise, delta, zero_point, inited)
+        self.p = p_val
+        self.alpha = None
+        self.inited = False
+
+    def forward(self, x: torch.Tensor):
+        if not self.inited:
+            self.init_alpha(x)
+        x_quant = self.__quantize__(x, 'round_ste')
+        x_dequant = self.__dequantize__(x_quant)
+        return x_dequant
+    
+    def init_alpha(self, weight_tensor: torch.Tensor):
+        with torch.no_grad():
+            self.alpha = optim.minimize_scalar(lambda alpha: self.estimate_quant_error(weight_tensor, alpha),
+                bounds=(weight_tensor.min().item(), weight_tensor.max().item())).x
+        self.delta = max((2 * self.alpha) / (self.n_levels - 1), 1e-8)
+        self.zero_point = self.alpha / self.delta
+        self.__register_buffer__('delta', self.delta)
+        self.__register_buffer__('zero_point', self.zero_point)
+        self.inited = True
+
+    def estimate_quant_error(self, x, alpha):
+        delta = max((2 * alpha.abs()) / (self.n_levels - 1), 1e-8)
+        zero_point = alpha.abs() / delta
+        x_int = torch.round(x / delta) # we assume weight quantization is always signed
+        x_quant = torch.clamp(x_int + zero_point, 0, self.n_levels - 1)
+        x_dequant = (x_quant - zero_point) * delta
+        err = torch.mean(torch.abs(x_dequant - x) ** self.p)
+        return err.item()
+    
+        
+
 
 
 class BitSplitQuantizer(object):
