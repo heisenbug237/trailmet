@@ -1,19 +1,44 @@
 import torch
 import torch.nn as nn
-import torch.distributed as dist
+from typing import Union
 from trailmet.utils import seed_everything
-from trailmet.algorithms.quantize.quantize import BaseQuantization, BaseQuantModel#, StraightThrough
-# from trailmet.models.resnet import BasicBlock, Bottleneck
-# from trailmet.models.mobilenet import InvertedResidual
-from trailmet.algorithms.quantize.qmodel import QuantModule, BaseQuantBlock
-# from trailmet.algorithms.quantize.qmodel import QuantBasicBlock, QuantBottleneck, QuantInvertedResidual
-from trailmet.algorithms.quantize.reconstruct import layer_reconstruction, block_reconstruction
+from trailmet.algorithms.quantize.quantize import BaseQuantization, BaseQuantModel
+from trailmet.algorithms.quantize.quantize import GetLayerGrad, GetLayerInpOut, BaseQuantLoss
+from trailmet.algorithms.quantize.modules import StraightThrough, QuantModule, BaseQuantBlock
+from trailmet.algorithms.quantize.methods import UniformAffineQuantizer, AdaRoundQuantizer
 
-# supported = {
-#     BasicBlock: QuantBasicBlock,
-#     Bottleneck: QuantBottleneck,
-#     InvertedResidual: QuantInvertedResidual,
-# }
+
+class QuantModel(BaseQuantModel):
+    def __init__(self, model: nn.Module, weight_quant_params: dict, act_quant_params: dict):
+        super(QuantModel, self).__init__(model, weight_quant_params, act_quant_params, fold_bn=True)
+
+    def reset_scale_method(self, scale_method = 'mse', act_quant_reset = False):
+        for module in self.quant_modules:
+            module.weight_quantizer.scale_method = scale_method
+            module.weight_quantizer.inited = False
+            if act_quant_reset:
+                module.act_quantizer.scale_method = scale_method
+                module.act_quantizer.inited = False
+    
+    def set_head_stem_precision(self, bitwidth):
+        """
+        Set the precision (bitwidth) for weights and activations for the first and last 
+        layers of the model. Also ignore reconstruction for the first layer.
+        """
+        assert len(self.quant_modules) >= 2, 'Model has less than 2 quantization modules'
+        self.quant_modules[0].weight_quantizer.bitwidth_refactor(bitwidth)
+        self.quant_modules[0].act_quantizer.bitwidth_refactor(bitwidth)
+        self.quant_modules[-1].weight_quantizer.bitwidth_refactor(bitwidth)
+        self.quant_modules[-2].act_quantizer.bitwidth_refactor(bitwidth)
+        self.quant_modules[0].ignore_reconstruction = True
+
+    def disable_network_output_quantization(self):
+        """
+        Disable Network Output Quantization
+        """
+        self.quant_modules[-1].disable_act_quant = True
+
+    
 
 class BRECQ(BaseQuantization):
     """
@@ -52,19 +77,20 @@ class BRECQ(BaseQuantization):
 
         self.iters_w = self.kwargs.get('ITERS_W', 10000)
         self.iters_a = self.kwargs.get('ITERS_A', 10000)
-        self.optimizer = self.kwargs.get('OPTIMIZER', 'adam')
+        self.optim = self.kwargs.get('OPTIMIZER', torch.optim.adam)
         self.weight = self.kwargs.get('WEIGHT', 0.01)
-        self.lr = self.kwargs.get('LR', 4e-4)
+        self.lr = self.kwargs.get('LR', 4e-5)
+        self.p = self.kwargs.get('P_VAL', 2.4)    # Lp norm minimization for LSQ
 
         self.gpu_id = self.kwargs.get('GPU_ID', 0)
-        self.calib_bs = self.kwargs.get('CALIB_BS', 64)
+        self.batch_size = self.kwargs.get('BATCH_SIZE', 64)
         self.seed = self.kwargs.get('SEED', 42)
-        self.p = 2.4         # Lp norm minimization for LSQ
         self.b_start = 20    # temperature at the beginning of calibration
         self.b_end = 2       # temperature at the end of calibration
         self.test_before_calibration = True
         self.device = torch.device('cuda:{}'.format(self.gpu_id))
         torch.cuda.set_device(self.gpu_id)
+        self.calib_data = self.get_calib_samples(self.train_loader, self.num_samples)
         seed_everything(self.seed)
         print('==> Using seed :',self.seed)
 
@@ -78,13 +104,13 @@ class BRECQ(BaseQuantization):
         weight_quant_params = {
             'n_bits': self.w_bits, 
             'channel_wise': self.channel_wise, 
-            'method': 'uaq',
+            'method': UniformAffineQuantizer,
             'scale_method': self.scale_method,
         }
         act_quant_params = {
             'n_bits': self.a_bits, 
             'channel_wise': False, 
-            'method': 'uaq',
+            'method': UniformAffineQuantizer,
             'scale_method': self.scale_method, 
             'leaf_param': self.act_quant,
         }
@@ -106,24 +132,20 @@ class BRECQ(BaseQuantization):
             print('==> Setting the first and the last layer to 8-bit')
             self.qnn.set_head_stem_precision(8)
 
-        self.cali_data = self.get_calib_samples(self.train_loader, self.num_samples)
         self.qnn.set_quant_state(True, False)
         print('==> Initializing weight quantization parameters')
-        _ = self.qnn(self.cali_data[:self.calib_bs].to(self.device))
+        _ = self.qnn(self.calib_data[:self.batch_size].to(self.device))
         if self.test_before_calibration:
             print('Quantized accuracy before brecq: {}'.format(self.test(self.qnn, self.test_loader, device=self.device)))
         
         # Start quantized weight calibration
         kwargs = dict(
-            cali_data=self.cali_data, 
             iters=self.iters_w, 
-            weight=self.weight, 
+            opt_mode='mse', 
+            act_quant=False, 
             asym=True,
             b_range=(self.b_start, self.b_end), 
             warmup=0.2, 
-            act_quant=False, 
-            opt_mode='mse', 
-            optim=self.optimizer
         )
         print('==> Starting quantized-weight rounding parameter (alpha) calibration')
         self.reconstruct_model(self.qnn, **kwargs)
@@ -134,18 +156,14 @@ class BRECQ(BaseQuantization):
             # Initialize activation quantization parameters
             self.qnn.set_quant_state(True, True)
             with torch.no_grad():
-                _ = self.qnn(self.cali_data[:self.calib_bs].to(self.device))
+                _ = self.qnn(self.calib_data[:self.calib_bs].to(self.device))
             self.qnn.disable_network_output_quantization()
             
             # Start activation rounding calibration
             kwargs = dict(
-                cali_data=self.cali_data, 
                 iters=self.iters_a, 
-                act_quant=True, 
                 opt_mode='mse', 
-                lr=self.lr, 
-                p=self.p, 
-                optim=self.optimizer
+                act_quant=True,  
             )
             print('==> Starting quantized-activation scaling parameter (delta) calibration')
             self.reconstruct_model(self.qnn, **kwargs)
@@ -170,175 +188,151 @@ class BRECQ(BaseQuantization):
                     continue
                 else:
                     print('Reconstruction for layer {}'.format(name))
-                    layer_reconstruction(self.qnn, child_module, **kwargs)
+                    self.reconstruct_module(self.qnn, child_module, **kwargs)
             elif isinstance(child_module, BaseQuantBlock):
                 if child_module.ignore_reconstruction is True:
                     print('Ignore reconstruction of {} block {}'.format(self._parent_name, name))
                     continue
                 else:
                     print('Reconstruction for {} block {}'.format(self._parent_name, name))
-                    block_reconstruction(self.qnn, child_module, **kwargs)
+                    self.reconstruct_module(self.qnn, child_module, **kwargs)
             else:
                 self._parent_name = name
                 self.reconstruct_model(child_module, **kwargs)
 
 
-class QuantModel(BaseQuantModel):
-    def __init__(self, model: nn.Module, weight_quant_params: dict, act_quant_params: dict):
-        super(QuantModel, self).__init__(model, weight_quant_params, act_quant_params, fold_bn=True)
-
-    def reset_scale_method(self, scale_method = 'mse', act_quant_reset = False):
-        for module in self.quant_modules:
-            module.weight_quantizer.scale_method = scale_method
-            module.weight_quantizer.inited = False
-            if act_quant_reset:
-                module.act_quantizer.scale_method = scale_method
-                module.act_quantizer.inited = False
-
-    def quantize_model_till(self, layer, act_quant: bool = False):
-        """
-        :param layer: layer upto which model is to be quantized.
-        :param act_quant: set True for activation quantization
-        """
-        self.set_quant_state(False, False)
-        for name, module in self.model.named_modules():
-            if isinstance(module, (QuantModule, BaseQuantBlock)):
-                module.set_quant_state(True, act_quant)
-            if module == layer:
-                break 
-    
-    def set_head_stem_precision(self, bitwidth):
-        """
-        Set the precision (bitwidth) for weights and activations for the first and last 
-        layers of the model. Also ignore reconstruction for the first layer.
-        """
-        assert len(self.quant_modules) >= 2, 'Model has less than 2 quantization modules'
-        self.quant_modules[0].weight_quantizer.bitwidth_refactor(bitwidth)
-        self.quant_modules[0].act_quantizer.bitwidth_refactor(bitwidth)
-        self.quant_modules[-1].weight_quantizer.bitwidth_refactor(bitwidth)
-        self.quant_modules[-2].act_quantizer.bitwidth_refactor(bitwidth)
-        self.quant_modules[0].ignore_reconstruction = True
-
-    def disable_network_output_quantization(self):
-        """
-        Disable Network Output Quantization
-        """
-        self.quant_modules[-1].disable_act_quant = True
-
-    def synchorize_activation_statistics(self):
-        """
-        Synchronize the statistics of the activation quantizers across all distributed workers.
-        """
-        for m in self.modules():
-            if isinstance(m, QuantModule):
-                if m.act_quantizer.delta is not None:
-                    m.act_quantizer.delta.data /= dist.get_world_size()
-                    dist.all_reduce(m.act_quantizer.delta.data)
-    
-
-# class QuantModel(nn.Module):
-#     """
-#     Recursively replace the normal conv2d and Linear layer to QuantModule, to enable 
-#     calculating activation statistics and storing scaling factors.
-
-#     :param module: nn.Module with nn.Conv2d or nn.Linear in its children
-#     :param weight_quant_params: quantization parameters like n_bits for weight quantizer
-#     :param act_quant_params: quantization parameters like n_bits for activation quantizer
-#     """
-#     def __init__(self, model: nn.Module, weight_quant_params: dict = {}, act_quant_params: dict = {}):
-#         super().__init__()
-#         self.model = model
-#         bn = FoldBN()
-#         bn.search_fold_and_remove_bn(self.model)
-#         self.quant_module_refactor(self.model, weight_quant_params, act_quant_params)
-#         self.quant_modules = [m for m in self.model.modules() if isinstance(m, QuantModule)]
-
-#     def quant_module_refactor(self, module: nn.Module, weight_quant_params: dict = {}, act_quant_params: dict = {}):
-#         prev_quantmodule = None
-#         for name, child_module in module.named_children():
-#             if type(child_module) in supported:
-#                 setattr(module, name, supported[type(child_module)](child_module, weight_quant_params, act_quant_params))
-
-#             elif isinstance(child_module, (nn.Conv2d, nn.Linear)):
-#                 setattr(module, name, QuantModule(child_module, weight_quant_params, act_quant_params))
-#                 prev_quantmodule = getattr(module, name)
-
-#             elif isinstance(child_module, (nn.ReLU, nn.ReLU6)):
-#                 if prev_quantmodule is not None:
-#                     prev_quantmodule.activation_function = child_module
-#                     setattr(module, name, StraightThrough())
-#                 else:
-#                     continue
-
-#             elif isinstance(child_module, StraightThrough):
-#                 continue
-
-#             else:
-#                 self.quant_module_refactor(child_module, weight_quant_params, act_quant_params)
-    
-#     def set_quant_state(self, weight_quant: bool = False, act_quant: bool = False):
-#         """
-#         :param weight_quant: set True for weight quantization
-#         :param act_quant: set True for activation quantization
-#         """
-#         for m in self.model.modules():
-#             if isinstance(m, (QuantModule, BaseQuantBlock)):
-#                 m.set_quant_state(weight_quant, act_quant)
-
-#     def quantize_model_till(self, layer, act_quant: bool = False):
-#         """
-#         :param layer: block/layer upto which model is to be quantized.
-#         :param act_quant: set True for activation quantization
-#         """
-#         self.set_quant_state(False, False)
-#         for name, module in self.model.named_modules():
-#             if isinstance(module, (QuantModule, BaseQuantBlock)):
-#                 module.set_quant_state(True, act_quant)
-#             if module == layer:
-#                 break
-
-#     def forward(self, input):
-#         return self.model(input)
-
-#     def set_first_last_layer_to_8bit(self):
-#         """
-#         Set the precision (bitwidth) used for quantizing weights and activations to 8-bit
-#         for the first and last layers of the model. Also ignore reconstruction for the first layer.
-#         """
-#         assert len(self.quant_modules) >= 2, 'Model has less than 2 quantization modules'
-#         self.quant_modules[0].weight_quantizer.bitwidth_refactor(8)
-#         self.quant_modules[0].act_quantizer.bitwidth_refactor(8)
-#         self.quant_modules[-1].weight_quantizer.bitwidth_refactor(8)
-#         self.quant_modules[-2].act_quantizer.bitwidth_refactor(8)
-#         self.quant_modules[0].ignore_reconstruction = True
-
-#     def disable_network_output_quantization(self):
-#         self.quant_modules[-1].disable_act_quant = True
-
-#     def set_layer_precision(self, weight_bit=8, act_bit=8, start=0, end=None):
-#         """
-#         Set the precision (bitwidth) used for quantizing weights and activations
-#         for a range of layers in the model.
-
-#         :param weight_bit: number of bits to use for quantizing weights
-#         :param act_bit: number of bits to use for quantizing activations
-#         :param start: index of the first layer to set the precision for (default: 0)
-#         :param end: index of the last layer to set the precision for (default: None, i.e., the last layer)
-#         """
-#         assert start>=0 and end>=0, 'layer index cannot be negative'
-#         assert start<len(self.quant_modules) and end<len(self.quant_modules), 'layer index out of range'
+    def reconstruct_module(self, 
+            model: BaseQuantModel, module: Union[QuantModule, BaseQuantBlock],
+            iters: int = 10000, opt_mode: str = 'mse', act_quant: bool = False, 
+            asym: bool = False, include_act_func: bool = True, b_range: tuple = (20, 2), 
+            warmup: float = 0.0):
         
-#         for module in self.quant_modules[start: end+1]:
-#             module.weight_quantizer.bitwidth_refactor(weight_bit)
-#             if module is not self.quant_modules[-1]:
-#                 module.act_quantizer.bitwidth_refactor(act_bit)
+        model.set_quant_state(False, False)
+        module.set_quant_state(True, act_quant)
+        round_mode = 'learned_hard_sigmoid'
+        opt_params = []
 
-#     def synchorize_activation_statistics(self):
-#         """
-#         Synchronize the statistics of the activation quantizers across all distributed workers.
-#         """
-#         for m in self.modules():
-#             if isinstance(m, QuantModule):
-#                 if m.act_quantizer.delta is not None:
-#                     m.act_quantizer.delta.data /= dist.get_world_size()
-#                     dist.all_reduce(m.act_quantizer.delta.data) 
+        if not include_act_func:
+            org_act_func = module.activation_function
+            module.activation_function = StraightThrough()
+
+        if not act_quant:
+            # Replace weight quantizer to AdaRoundQuantizer and learn alpha
+            if isinstance(module, QuantModule):
+                module.weight_quantizer = AdaRoundQuantizer(
+                    uaq = module.weight_quantizer, round_mode = round_mode,
+                    weight_tensor = module.org_weight.data)
+                module.weight_quantizer.soft_targets = True
+                opt_params.append(module.weight_quantizer.alpha)
+
+            if isinstance(module, BaseQuantBlock):
+                for name, submodule in module.named_modules():
+                    if isinstance(submodule, QuantModule):
+                        submodule.weight_quantizer = AdaRoundQuantizer(
+                            uaq = submodule.weight_quantizer, round_mode = round_mode,
+                            weight_tensor = submodule.org_weight.data)
+                        submodule.weight_quantizer.soft_targets = True
+                        opt_params.append(submodule.weight_quantizer.alpha)
+
+            optimizer = self.optim(opt_params)
+            scheduler = None
+        else:
+            # Use UniformAffineQuantizer to learn delta for activations
+            if hasattr(module.act_quantizer, 'delta'):
+                opt_params.append(module.act_quantizer.delta)
+            if isinstance(module, BaseQuantBlock):
+                for name, submodule in module.named_modules():
+                    if isinstance(submodule, QuantModule) and submodule.act_quantizer.delta is not None:
+                        opt_params.append(submodule.act_quantizer.delta)
+
+            optimizer = self.optim(opt_params, lr = self.lr)
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=iters, eta_min=0.)
+
+
+        loss_mode = 'none' if act_quant else 'relaxation'
+        # rec_loss = opt_mode
+        loss_func = BaseQuantLoss(
+            module, round_loss=loss_mode, weight=self.weight, max_count=iters, 
+            rec_loss=opt_mode, b_range=b_range, decay_start=0, warmup=warmup, p=self.p)
+
+        # Save data before optimizing the rounding
+        cached_inps, cached_outs = self.save_inp_oup_data(model, module, asym, act_quant)
+        if opt_mode != 'mse':
+            cached_grads = self.save_grad_data(model, module, act_quant)
+        else:
+            cached_grads = None
+
+        for i in range(iters):
+            idx = torch.randperm(cached_inps.size(0))[:self.batch_size]
+            cur_inp = cached_inps[idx].to(self.device)
+            cur_out = cached_outs[idx].to(self.device)
+            cur_grad = cached_grads[idx].to(self.device) if opt_mode != 'mse' else None
+
+            optimizer.zero_grad()
+            out_quant = module(cur_inp)
+
+            err = loss_func(out_quant, cur_out, cur_grad)
+            err.backward(retain_graph=True)
+
+            optimizer.step()
+            if scheduler:
+                scheduler.step()
+
+        torch.cuda.empty_cache()
+
+        # Finish optimization, use hard rounding.
+        if isinstance(module, QuantModule):
+            module.weight_quantizer.soft_targets = False
+        if isinstance(module, BaseQuantBlock):
+            for name, submodule in module.named_modules():
+                if isinstance(submodule, QuantModule):
+                    submodule.weight_quantizer.soft_targets = False
+
+        # Reset original activation function
+        if not include_act_func:
+            module.activation_function = org_act_func
+
+
+    def save_inp_oup_data(self, model, layer: Union[QuantModule, BaseQuantBlock],
+            asym: bool = False, act_quant: bool = False):
+        """
+        Function to save input data and output data of a particular layer/block over calibration dataset.
+        """
+        get_inp_out = GetLayerInpOut(model, layer, device=self.device, asym=asym, act_quant=act_quant)
+        cached_batches = []
+        torch.cuda.empty_cache()
+
+        for i in range(int(self.calib_data.size(0) / self.batch_size)):
+            cur_inp, cur_out = get_inp_out(self.calib_data[i * self.batch_size:(i + 1) * self.batch_size])
+            cached_batches.append((cur_inp.cpu(), cur_out.cpu()))
+
+        cached_inps = torch.cat([x[0] for x in cached_batches])
+        cached_outs = torch.cat([x[1] for x in cached_batches])
+        torch.cuda.empty_cache()
+
+        cached_inps = cached_inps.to(self.device)
+        cached_outs = cached_outs.to(self.device)
+        return cached_inps, cached_outs
+        
+
+    def save_grad_data(self, model: QuantModel, layer: Union[QuantModule, BaseQuantBlock], 
+            act_quant: bool = False):
+        """
+        Function to save gradient data of a particular layer/block over calibration dataset.
+        """
+        get_grad = GetLayerGrad(model, layer, self.device, act_quant=act_quant)
+        cached_batches = []
+        torch.cuda.empty_cache()
+
+        for i in range(int(self.calib_data.size(0) / self.batch_size)):
+            cur_grad = get_grad(self.calib_data[i * self.batch_size:(i + 1) * self.batch_size])
+            cached_batches.append(cur_grad.cpu())
+
+        cached_grads = torch.cat([x for x in cached_batches])
+        cached_grads = cached_grads.abs() + 1.0
+        # scaling to make sure its mean is 1
+        # cached_grads = cached_grads * torch.sqrt(cached_grads.numel() / cached_grads.pow(2).sum())
+        torch.cuda.empty_cache()
+
+        cached_grads = cached_grads.to(self.device)
+        return cached_grads

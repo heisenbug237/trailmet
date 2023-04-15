@@ -271,52 +271,6 @@ class LpNormQuantizer(MaxAbsQuantizer):
 
 
 
-# class LpNormQuantizer_v1(BaseQuantizer):
-#     """
-#     no affine (symmetric), no channel_wise (layer wise)
-#     """
-#     def __init__(self, n_bits, p_val, inited=False, **kwargs):
-#         super().__init__(n_bits, symm=True, channel_wise=False, delta=None, zero_point=None, inited=inited)
-#         self.p = p_val
-#         self.alpha = None
-
-#     def forward(self, x: torch.Tensor):
-#         if not self.inited:
-#             self.init_alpha(x)
-#         x_quant = self.__quantize__(x, 'nearest_ste')
-#         x_dequant = self.__dequantize__(x_quant)
-#         return x_dequant
-    
-#     def init_alpha(self, weight_tensor: torch.Tensor):
-#         with torch.no_grad():
-#             optim_alpha = optim.minimize_scalar(lambda alpha: self.estimate_quant_error(weight_tensor, alpha),
-#                 bounds=(weight_tensor.min().item(), weight_tensor.max().item())).x
-#             #optim_alpha = weight_tensor.abs().max().item()
-#         self.set_params_from_alpha(optim_alpha)
-#         self.inited = True
-
-#     def set_params_from_alpha(self, alpha):
-#         self.alpha = torch.tensor(alpha)
-#         delta = max((2 * alpha) / (self.n_levels - 1), 1e-8)
-#         zero_point = alpha / delta
-#         self.__register_buffer__('delta', torch.tensor(delta))
-#         self.__register_buffer__('zero_point', torch.tensor(zero_point))
-
-#     def estimate_quant_error(self, x, alpha):
-#         delta = max((2 * alpha) / (self.n_levels - 1), 1e-8)
-#         zero_point = round(alpha / delta)
-#         x_int = torch.round(x / delta) # we assume weight quantization is always signed
-#         x_quant = torch.clamp(x_int + zero_point, 0, self.n_levels - 1)
-#         x_dequant = (x_quant - zero_point) * delta
-#         err = torch.mean(torch.abs(x_dequant - x) ** self.p)
-#         return err.item()
-    
-#     def extra_repr(self):
-#         s = 'bit={n_bits}, symmetric={symmetric}, channel_wise={channel_wise}, p_val={p}, '\
-#             'alpha={alpha}, inited={inited}' 
-#         return s.format(**self.__dict__)    
-
-
 
 
 class BitSplitQuantizer(object):

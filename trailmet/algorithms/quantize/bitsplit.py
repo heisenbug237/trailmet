@@ -11,7 +11,7 @@ from trailmet.utils import seed_everything
 from trailmet.algorithms.quantize.quantize import BaseQuantization
 from trailmet.models.resnet import BasicBlock, Bottleneck
 from trailmet.models.mobilenet import InvertedResidual
-from trailmet.algorithms.quantize.qmodel import QBasicBlock, QBottleneck, QInvertedResidual
+from trailmet.algorithms.quantize.modules import QBasicBlock, QBottleneck, QInvertedResidual
 from trailmet.algorithms.quantize.methods import BitSplitQuantizer, ActQuantizer
 
 
