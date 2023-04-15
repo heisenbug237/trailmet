@@ -7,7 +7,8 @@ from trailmet.models.resnet import BasicBlock, Bottleneck
 from trailmet.models.mobilenet import InvertedResidual
 # from trailmet.algorithms.quantize.quantize import StraightThrough
 from trailmet.algorithms.quantize.methods import MaxAbsStaticQuantization, LpNormQuantization
-from trailmet.algorithms.quantize.methods import UniformAffineQuantizer
+from trailmet.algorithms.quantize.methods import UniformAffineQuantizer, AdaRoundQuantizer
+from trailmet.algorithms.quantize.methods import LpNormQuantizer
 from trailmet.algorithms.quantize.methods import ActQuantizer
  
 
@@ -20,6 +21,13 @@ class StraightThrough(nn.Module):
     def forward(self, input):
         return input
 
+
+quantization_methods = {
+    'uaq' : UniformAffineQuantizer,
+    'adaround' : AdaRoundQuantizer,
+    'lp_norm' : LpNormQuantizer,
+    'max_static' : MaxAbsStaticQuantization,
+}
 
 #============================================
 #***** Quantization Modules for BRECQ *******
@@ -38,11 +46,11 @@ class QuantModule(nn.Module):
     To activate quantization, please use set_quant_state function.
     """
     def __init__(self, org_module: Union[nn.Conv2d, nn.Linear], weight_quant_params: dict = {},
-                 act_quant_params: dict = {}, disable_act_quant: bool = False, se_module=None):
+            act_quant_params: dict = {}, disable_act_quant: bool = False, se_module = None):
         super(QuantModule, self).__init__()
         if isinstance(org_module, nn.Conv2d):
             self.fwd_kwargs = dict(stride=org_module.stride, padding=org_module.padding,
-                                   dilation=org_module.dilation, groups=org_module.groups)
+                dilation=org_module.dilation, groups=org_module.groups)
             self.fwd_func = F.conv2d
         else:
             self.fwd_kwargs = dict()
@@ -60,8 +68,8 @@ class QuantModule(nn.Module):
         self.use_act_quant = False
         self.disable_act_quant = disable_act_quant
         # initialize quantizer
-        self.weight_quantizer = UniformAffineQuantizer(**weight_quant_params)
-        self.act_quantizer = UniformAffineQuantizer(**act_quant_params)
+        self.weight_quantizer = quantization_methods[weight_quant_params['method']](**weight_quant_params)
+        self.act_quantizer = quantization_methods[act_quant_params['method']](**act_quant_params)
 
         self.activation_function = StraightThrough()
         self.ignore_reconstruction = False
@@ -106,11 +114,8 @@ class BaseQuantBlock(nn.Module):
         super().__init__()
         self.use_weight_quant = False
         self.use_act_quant = False
-        # initialize quantizer
-
-        self.act_quantizer = UniformAffineQuantizer(**act_quant_params)
+        self.act_quantizer = quantization_methods[act_quant_params['method']](**act_quant_params)
         self.activation_function = StraightThrough()
-
         self.ignore_reconstruction = False
 
     def set_quant_state(self, weight_quant: bool = False, act_quant: bool = False):
@@ -130,15 +135,13 @@ class QuantBasicBlock(BaseQuantBlock):
         self.conv1 = QuantModule(basic_block.conv1, weight_quant_params, act_quant_params)
         self.conv1.activation_function = basic_block.activ
         self.conv2 = QuantModule(basic_block.conv2, weight_quant_params, act_quant_params, disable_act_quant=True)
-
-        # modify the activation function to ReLU
         self.activation_function = basic_block.activ
 
         if basic_block.downsample is None:
             self.downsample = None
         else:
             self.downsample = QuantModule(basic_block.downsample[0], weight_quant_params, act_quant_params,
-                                          disable_act_quant=True)
+                disable_act_quant=True)
         # copying all attributes in original block
         self.stride = basic_block.stride
 
@@ -172,7 +175,7 @@ class QuantBottleneck(BaseQuantBlock):
             self.downsample = None
         else:
             self.downsample = QuantModule(bottleneck.downsample[0], weight_quant_params, act_quant_params,
-                                          disable_act_quant=True)
+                disable_act_quant=True)
         # copying all attributes in original block
         self.stride = bottleneck.stride
 

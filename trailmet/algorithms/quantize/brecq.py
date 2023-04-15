@@ -48,7 +48,7 @@ class BRECQ(BaseQuantization):
         self.arch = self.kwargs.get('ARCH', '')
         self.save_path = self.kwargs.get('SAVE_PATH', './runs/')
         self.num_samples = self.kwargs.get('NUM_SAMPLES', 1024)
-        self.init_method = self.kwargs.get('INIT_METHOD', 'mse')
+        self.scale_method = self.kwargs.get('SCALE_METHOD', 'mse')
 
         self.iters_w = self.kwargs.get('ITERS_W', 10000)
         self.iters_a = self.kwargs.get('ITERS_A', 10000)
@@ -73,21 +73,23 @@ class BRECQ(BaseQuantization):
         """
         method to build quantization parameters and finetune weights and/or activations
         """
-        wq_params = {
+        self.model.to(self.device)
+        self.model.eval()
+        weight_quant_params = {
             'n_bits': self.w_bits, 
             'channel_wise': self.channel_wise, 
-            'scale_method': 'mse'
+            'method': 'uaq',
+            'scale_method': self.scale_method,
         }
-        aq_params = {
+        act_quant_params = {
             'n_bits': self.a_bits, 
             'channel_wise': False, 
-            'scale_method': 'mse', 
-            'leaf_param': self.act_quant
+            'method': 'uaq',
+            'scale_method': self.scale_method, 
+            'leaf_param': self.act_quant,
         }
-        self.model = self.model.to(self.device)
-        self.model.eval()
-        self.qnn = QuantModel(model=self.model, weight_quant_params=wq_params, act_quant_params=aq_params)
-        self.qnn = self.qnn.to(self.device)
+        self.qnn = QuantModel(self.model, weight_quant_params, act_quant_params)
+        self.qnn.to(self.device)
         self.qnn.eval()
 
         w_compr = self.w_bits/32 if self.w_budget is None else self.w_budget
@@ -98,7 +100,7 @@ class BRECQ(BaseQuantization):
             print('==> Found optimal config for approx model size: {:.2f} MB ' \
                 ' (orig {:.2f} MB)'.format(qm_size, max_size/self.w_budget))
             self.qnn.set_layer_precision(w_bits, self.a_bits)
-            self.qnn.reset_scale_method(self.init_method, True)
+            self.qnn.reset_scale_method(self.scale_method, True)
         
         if self.set_8bit_head_stem:
             print('==> Setting the first and the last layer to 8-bit')
@@ -148,7 +150,8 @@ class BRECQ(BaseQuantization):
             print('==> Starting quantized-activation scaling parameter (delta) calibration')
             self.reconstruct_model(self.qnn, **kwargs)
             self.qnn.set_quant_state(weight_quant=True, act_quant=True)
-            torch.save(self.qnn.state_dict(), f'{self.save_path}/weights/{self.arch}_{w_compr}_{self.a_bits}.pth')
+
+            # torch.save(self.qnn.state_dict(), f'{self.save_path}/weights/{self.arch}_{w_compr}_{self.a_bits}.pth')
             print('Full quantization (W{}A{}) accuracy: {}'.format(w_compr, self.a_bits, 
                 self.test(self.qnn, self.test_loader, device=self.device))) 
         return self.qnn

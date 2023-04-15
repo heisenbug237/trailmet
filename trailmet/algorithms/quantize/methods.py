@@ -31,7 +31,7 @@ class FloorSTE(torch.autograd.Function):
 class BaseQuantizer(nn.Module):
     def __init__(self, n_bits, symm, channel_wise, delta, zero_point, inited):
         super(BaseQuantizer, self).__init__()
-        assert n_bits in [2,3,4,8,16,32], 'bitwidth not supported'
+        assert n_bits in [2, 3, 4, 8, 16, 32], 'bitwidth not supported'
         self.n_bits = n_bits
         self.n_levels = 2 ** self.n_bits
         self.symmetric = symm
@@ -230,14 +230,12 @@ class AdaRoundQuantizer(BaseQuantizer):
 
 class LpNormQuantizer(BaseQuantizer):
     """
-    no affine, no channel_wise
+    no affine (symmetric), no channel_wise (layer wise)
     """
-    def __init__(self, n_bits, symm, channel_wise, delta, zero_point, inited, 
-            p_val, weight_tensor: torch.Tensor):
-        super().__init__(n_bits, symm, channel_wise, delta, zero_point, inited)
+    def __init__(self, n_bits, p_val, inited=False):
+        super().__init__(n_bits, symm=True, channel_wise=False, delta=None, zero_point=None, inited=inited)
         self.p = p_val
         self.alpha = None
-        self.inited = False
 
     def forward(self, x: torch.Tensor):
         if not self.inited:
@@ -248,17 +246,21 @@ class LpNormQuantizer(BaseQuantizer):
     
     def init_alpha(self, weight_tensor: torch.Tensor):
         with torch.no_grad():
-            self.alpha = optim.minimize_scalar(lambda alpha: self.estimate_quant_error(weight_tensor, alpha),
-                bounds=(weight_tensor.min().item(), weight_tensor.max().item())).x
-        self.delta = max((2 * self.alpha) / (self.n_levels - 1), 1e-8)
-        self.zero_point = self.alpha / self.delta
-        self.__register_buffer__('delta', self.delta)
-        self.__register_buffer__('zero_point', self.zero_point)
+            optim_alpha = optim.minimize_scalar(lambda alpha: self.estimate_quant_error(weight_tensor, alpha),
+                bounds=(weight_tensor.abs().min().item(), weight_tensor.abs().max().item())).x
+        self.set_params_from_alpha(optim_alpha)
         self.inited = True
 
+    def set_params_from_alpha(self, alpha):
+        self.alpha = alpha
+        self.delta = max((2 * alpha) / (self.n_levels - 1), 1e-8)
+        self.zero_point = alpha / self.delta
+        self.__register_buffer__('delta', self.delta)
+        self.__register_buffer__('zero_point', self.zero_point)
+
     def estimate_quant_error(self, x, alpha):
-        delta = max((2 * alpha.abs()) / (self.n_levels - 1), 1e-8)
-        zero_point = alpha.abs() / delta
+        delta = max((2 * alpha) / (self.n_levels - 1), 1e-8)
+        zero_point = alpha / delta
         x_int = torch.round(x / delta) # we assume weight quantization is always signed
         x_quant = torch.clamp(x_int + zero_point, 0, self.n_levels - 1)
         x_dequant = (x_quant - zero_point) * delta
