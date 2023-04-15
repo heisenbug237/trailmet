@@ -17,23 +17,27 @@ from trailmet.algorithms.quantize.qmodel import QuantModule, BaseQuantBlock
 class QuantModel(BaseQuantModel):
     def __init__(self, model: nn.Module, weight_quant_params: dict, act_quant_params: dict, fold_bn=True):
         super().__init__(model, weight_quant_params, act_quant_params, fold_bn) 
-        self.quantizers = []
+        self.weight_quantizers = []
+        self.act_quantizers = []
         for module in self.model.modules():
             if isinstance(module, QuantModule):
-                self.quantizers.append(module.weight_quantizer)
-                self.quantizers.append(module.act_quantizer)
+                self.weight_quantizers.append(module.weight_quantizer)
+                if not module.disable_act_quant:
+                    self.act_quantizers.append(module.act_quantizer)
             elif isinstance(module, BaseQuantBlock):
-                self.quantizers.append(module.act_quantizer)
+                self.act_quantizers.append(module.act_quantizer)
 
-    def get_alphas_np(self):
+    def get_alphas_np(self, weight=True, act=True):
         alphas = []
-        for quantizer in self.quantizers:
-            alphas.append(quantizer.alpha)
+        quantizers = (self.weight_quantizers if weight else []) + (self.act_quantizers if act else [])
+        for quantizer in quantizers:
+                alphas.append(quantizer.alpha)
         return torch.tensor(alphas).numpy()
     
-    def set_alphas_np(self, alphas: np.ndarray):
-        for i, quantizer in  enumerate(self.quantizers):
-            quantizer.set_params_from_alpha(torch.tensor(alphas[i]))
+    def set_alphas_np(self, alphas: np.ndarray, weight=True, act=True):
+        quantizers = (self.weight_quantizers if weight else []) + (self.act_quantizers if act else [])     
+        for i, quantizer in enumerate(quantizers):
+            quantizer.set_params_from_alpha(alphas[i])
         
 
 class LAPQ(BaseQuantization):
@@ -65,20 +69,30 @@ class LAPQ(BaseQuantization):
     def compress_model(self):
         self.model.to(self.device)
         self.model.eval()
-        # self.search_absorbe_bn(self.model)
+
         weight_quant_params = {
             'n_bits': self.w_bits,
             'bcorr': True,
-            'method': 'lp_norm',
+            'method': 'max_abs',
             'p_val': 2.0,
         }
         act_quant_params = {
-            'n_bits': self.w_bits,
+            'n_bits': self.a_bits,
             'bcorr': True,
-            'method': 'lp_norm',
+            'method': 'max_abs',
             'p_val': 2.0,
         }
 
+        if self.test_before_calibration:
+            qnn = QuantModel(self.model, weight_quant_params, act_quant_params)
+            qnn.set_quant_state(True, True)
+            acc1, acc5 = self.test(qnn, self.test_loader, device=self.device)
+            print('==> Quantization (W{}A{}) accuracy before LAPQ: {:.4f} | {:.4f}'.format(
+                self.w_bits, self.a_bits, acc1, acc5))
+            del qnn
+
+        weight_quant_params['method'] = 'lp_norm'
+        act_quant_params['method'] = 'lp_norm'
         p_vals = np.linspace(2,4,10)
         losses = []
         pbar = tqdm(p_vals, total=len(p_vals))
@@ -86,6 +100,7 @@ class LAPQ(BaseQuantization):
             weight_quant_params['p_val'] = p
             act_quant_params['p_val'] = p
             qnn = QuantModel(self.model, weight_quant_params, act_quant_params)
+            qnn.set_quant_state(True, True)
             loss = self.evaluate_loss(qnn, self.device)
             losses.append(loss.item())
             pbar.set_postfix(p_val=p, loss=loss.item())
@@ -98,15 +113,16 @@ class LAPQ(BaseQuantization):
 
         weight_quant_params['p_val'] = p_intr
         act_quant_params['p_val'] = p_intr
-
         self.qnn = QuantModel(self.model, weight_quant_params, act_quant_params)
+        self.qnn.set_quant_state(weight_quant=True, act_quant=True)
         lp_acc1, lp_acc5 = self.test(self.qnn, self.test_loader, device=self.device)
         if self.verbose:
             print('==> Quantization (W{}A{}) accuracy before Optimization: {:.4f} | {:.4f}'.format(
                 self.w_bits, self.a_bits, lp_acc1, lp_acc5))
             print("==> Starting Powell Optimization")
-
+    
         init_alphas = self.qnn.get_alphas_np()
+        
         min_method = "Powell"
         min_options = {
             'maxiter' : self.maxiter,
@@ -122,7 +138,7 @@ class LAPQ(BaseQuantization):
 
         self.pbar = tqdm(total=min(self.maxiter, self.maxfev))
         res = optim.minimize(
-            lambda scales: self.evaluate_calibration(scales, self.qnn, self.device), init_alphas,
+            lambda alphas: self.evaluate_calibration(alphas, self.qnn, self.device), init_alphas,
             method=min_method, options=min_options, callback=local_search_callback
         )
         self.pbar.close()
